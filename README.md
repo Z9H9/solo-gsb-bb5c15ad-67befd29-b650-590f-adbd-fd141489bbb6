@@ -1,8 +1,9 @@
 # Carpool Fare Splitter · 拼车行程费用分摊 API
 
 基于 FastAPI 的拼车费用分摊服务：按顺序路段读取整数分费用与每位乘客的上下车站点，
-逐段均摊费用，输出逐人总额与逐路段明细。金额全程使用整数分与精确分数计算，
-总额严格守恒，且乘客输入顺序不影响结果。
+逐段均摊费用，输出逐人总额与逐路段明细；并可结合每位乘客的实际付款记录，
+生成笔数最少的转账方案完成结算。金额全程使用整数分与精确分数计算，
+总额严格守恒，且乘客与付款记录的输入顺序不影响结果。
 
 ## 快速启动
 
@@ -17,6 +18,7 @@ docker compose up --build
 | 地址 | 说明 |
 | --- | --- |
 | http://localhost:8000/split | 分摊接口（POST） |
+| http://localhost:8000/settle | 结算接口（POST） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/healthz | 健康检查 |
 
@@ -72,6 +74,70 @@ curl -s http://localhost:8000/split \
   -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}]}'
 ```
 
+## API：`POST /settle`
+
+在 `/split` 的分摊结果之上，结合每位乘客的**实际付款**完成结算：
+先计算每人应付额，再以「已付 − 应付」为余额，生成欠款人 → 收款人的转账方案。
+
+### 请求体
+
+```json
+{
+  "segments": [100, 251, 80],
+  "passengers": [
+    {"id": "alice", "board": 0, "alight": 3},
+    {"id": "bob",   "board": 1, "alight": 3},
+    {"id": "carol", "board": 0, "alight": 1}
+  ],
+  "payments": [
+    {"id": "alice", "amount": 250},
+    {"id": "bob",   "amount": 100},
+    {"id": "carol", "amount": 81}
+  ]
+}
+```
+
+- `segments` / `passengers`：与 `POST /split` 完全相同，校验规则一致。
+- `payments`：每位乘客**恰好一条**付款记录，`amount` 为实际支付的整数分（≥ 0）；
+  所有付款之和必须等于行程总费用（`sum(segments)`）。
+
+### 响应（200）
+
+```json
+{
+  "owed": {"alice": 216, "bob": 165, "carol": 50},
+  "paid": {"alice": 250, "bob": 100, "carol": 81},
+  "balance": {"alice": 34, "bob": -65, "carol": 31},
+  "transfers": [
+    {"from": "bob", "to": "alice", "amount": 34},
+    {"from": "bob", "to": "carol", "amount": 31}
+  ]
+}
+```
+
+- `owed`：逐人应付总额（分），与 `POST /split` 的 `totals` 一致。
+- `paid`：逐人实付金额（分）。
+- `balance`：`paid − owed`（分）；为正表示多付（应收回），为负表示欠款。
+- `transfers`：转账方案，`from`（欠款人）向 `to`（收款人）支付 `amount` 分；
+  全部执行后所有人余额归零。
+
+### 示例
+
+```bash
+curl -s http://localhost:8000/settle \
+  -H 'Content-Type: application/json' \
+  -d '{"segments":[100,251,80],"passengers":[{"id":"alice","board":0,"alight":3},{"id":"bob","board":1,"alight":3},{"id":"carol","board":0,"alight":1}],"payments":[{"id":"alice","amount":250},{"id":"bob","amount":100},{"id":"carol","amount":81}]}'
+```
+
+### 转账方案规则
+
+1. 余额（已付 − 应付）为负的是欠款人，为正的是收款人；转账只从欠款人流向收款人。
+2. 非零余额参与者不超过 **12** 人时，返回**转账笔数全局最少**的方案
+   （零和分组 + 子集动态规划精确求解）；超过 12 人时使用确定性贪心（每笔至少结清一方）。
+3. 最少笔数方案不唯一时，按乘客 ID 规范顺序（整数按数值、字符串按字典序，整数排在字符串前）
+   比较各方案的 `(from, to, amount)` 序列，返回字典序最小的唯一结果。
+4. 因此 `passengers` 与 `payments` 在请求中的排列顺序均不影响响应内容。
+
 ## 分摊规则
 
 1. 按路段顺序处理，每段找出全部在车乘客均摊：`base = cost // n`，余数 `r = cost % n`。
@@ -86,15 +152,18 @@ curl -s http://localhost:8000/split \
 
 - 空载收费路段：某段 `cost > 0` 但无任何乘客在车（费用为 0 的空载段允许）；
 - 非法区间：`board >= alight`、站点越界（`alight > 路段数`）或站点为负；
-- 乘客 ID 重复、费用为负、路段列表为空、字段类型错误或含未知字段。
+- 乘客 ID 重复、费用为负、路段列表为空、字段类型错误或含未知字段；
+- （`/settle`）付款记录缺失或与乘客对不上（每位乘客须恰好一条，不得出现未知 ID）；
+- （`/settle`）付款金额为负，或付款总额不等于行程总费用。
 
 ## 本地开发与测试
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest tests/          # 全部测试（算法 + API）
-python -m unittest tests.test_splitter   # 仅核心算法（纯标准库，无需安装依赖）
+python -m pytest tests/          # 全部测试（算法 + 结算 + API）
+python -m unittest tests.test_splitter    # 核心分摊算法（纯标准库，无需安装依赖）
+python -m unittest tests.test_settlement  # 结算算法（纯标准库，无需安装依赖）
 uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:8000
 ```
 
@@ -102,9 +171,10 @@ uvicorn app.main:app --reload    # 本地起服务，默认 http://127.0.0.1:800
 
 ```
 app/
-  main.py       # FastAPI 应用与路由（POST /split、GET /healthz）
+  main.py       # FastAPI 应用与路由（POST /split、POST /settle、GET /healthz）
   models.py     # 请求/响应模型与 422 校验规则
   splitter.py   # 核心分摊算法（纯标准库，精确分数运算）
+  settlement.py # 结算算法：余额 -> 最少转账方案（纯标准库，子集 DP）
 tests/          # 算法单元测试 + API 集成测试
 Dockerfile      # 依赖与启动命令均固化在镜像内
 compose.yaml    # 单服务编排，含健康检查
